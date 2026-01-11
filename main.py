@@ -1,106 +1,106 @@
 import os
+import glob
 import tempfile
 import subprocess
-from typing import Optional
-
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from openai import OpenAI
 
 app = FastAPI()
 
 
-# -----------------------------
-# Models
-# -----------------------------
-class TranscribeReq(BaseModel):
-    # Accept BOTH shapes to avoid mismatch issues:
-    # - {"videoUrl": "..."} (your current)
-    # - {"url": "..."}      (common for APIs / your Next.js might send this)
-    videoUrl: Optional[str] = Field(default=None)
-    url: Optional[str] = Field(default=None)
+class Req(BaseModel):
+    videoUrl: str
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def get_openai_client() -> OpenAI:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        # IMPORTANT: do NOT crash at import time
-        # Return a clean error when /transcribe is called
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
-    return OpenAI(api_key=api_key)
-
-
-def pick_video_url(req: TranscribeReq) -> str:
-    video_url = (req.videoUrl or req.url or "").strip()
-    if not video_url:
-        raise HTTPException(status_code=400, detail="videoUrl (or url) is required")
-    return video_url
-
-
-# -----------------------------
-# Routes
-# -----------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
+def run_yt_dlp(video_url: str, workdir: str) -> str:
+    """
+    Downloads best audio to workdir using yt-dlp.
+    Returns the path to the downloaded audio file.
+    """
+    # IMPORTANT: don't hardcode audio.m4a; YouTube often returns webm/opus.
+    out_template = os.path.join(workdir, "audio.%(ext)s")
+
+    # Prefer m4a if available; otherwise fallback to any bestaudio
+    fmt = "bestaudio[ext=m4a]/bestaudio"
+
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "--user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "--extractor-args",
+        "youtube:player_client=android",
+        "-f",
+        fmt,
+        "-o",
+        out_template,
+        video_url,
+    ]
+
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="yt-dlp timed out")
+
+    if p.returncode != 0:
+        # Return last part of stderr to keep it readable
+        tail = (p.stderr or p.stdout or "")[-1500:]
+        raise HTTPException(status_code=502, detail=f"yt-dlp failed:\n{tail}")
+
+    # Find whatever file yt-dlp actually produced
+    candidates = glob.glob(os.path.join(workdir, "audio.*"))
+    candidates = [c for c in candidates if os.path.isfile(c)]
+
+    if not candidates:
+        raise HTTPException(status_code=502, detail="yt-dlp reported success but no audio file was created")
+
+    # Pick the largest file (most likely the real audio)
+    candidates.sort(key=lambda pth: os.path.getsize(pth), reverse=True)
+    audio_path = candidates[0]
+
+    # Guard against empty files
+    if os.path.getsize(audio_path) < 1024:
+        raise HTTPException(
+            status_code=502,
+            detail=f"yt-dlp produced an empty/too-small file: {os.path.basename(audio_path)}",
+        )
+
+    return audio_path
+
+
 @app.post("/transcribe")
-def transcribe(req: TranscribeReq):
-    # Will only error when endpoint is called, not at server startup
-    client = get_openai_client()
+def transcribe(req: Req):
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
-    video_url = pick_video_url(req)
+    video_url = (req.videoUrl or "").strip()
+    if not video_url:
+        raise HTTPException(status_code=400, detail="videoUrl is required")
 
-    # Optional: yt-dlp sometimes needs a HOME set in containers
-    # (Railway usually has one, but this avoids edge cases)
-    env = os.environ.copy()
-    env.setdefault("HOME", "/tmp")
+    # Create client lazily so the app can boot even if env vars are missing
+    client = OpenAI(api_key=api_key)
 
     with tempfile.TemporaryDirectory() as td:
-        out_path = os.path.join(td, "audio.m4a")
-
-        cmd = [
-            "yt-dlp",
-            "-f", "bestaudio",
-            "--no-playlist",
-            "-o", out_path,
-            video_url,
-        ]
+        audio_path = run_yt_dlp(video_url, td)
 
         try:
-            p = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=180,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=504, detail="yt-dlp timed out")
-
-        if p.returncode != 0:
-            # Return the last chunk of stderr for debugging
-            err = (p.stderr or "").strip()
-            tail = err[-1200:] if err else "unknown error"
-            raise HTTPException(status_code=502, detail=f"yt-dlp failed: {tail}")
-
-        if not os.path.exists(out_path):
-            raise HTTPException(status_code=502, detail="audio file not created")
-
-        try:
-            with open(out_path, "rb") as f:
+            with open(audio_path, "rb") as f:
                 resp = client.audio.transcriptions.create(
                     model="whisper-1",
                     file=f,
                 )
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"whisper failed: {str(e)}")
+            raise HTTPException(status_code=502, detail=f"OpenAI Whisper failed: {str(e)}")
 
-        text = (getattr(resp, "text", "") or "").strip()
+        text = (getattr(resp, "text", None) or "").strip()
         if len(text) < 10:
             raise HTTPException(status_code=502, detail="empty transcript")
 
