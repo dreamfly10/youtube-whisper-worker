@@ -73,8 +73,7 @@ def run_yt_dlp(video_url: str, workdir: str) -> str:
         )
 
     return audio_path
-
-
+    
 @app.post("/transcribe")
 def transcribe(req: Req):
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -85,23 +84,50 @@ def transcribe(req: Req):
     if not video_url:
         raise HTTPException(status_code=400, detail="videoUrl is required")
 
-    # Create client lazily so the app can boot even if env vars are missing
     client = OpenAI(api_key=api_key)
 
     with tempfile.TemporaryDirectory() as td:
-        audio_path = run_yt_dlp(video_url, td)
+        out_path = os.path.join(td, "audio.%(ext)s")
+        final_audio = os.path.join(td, "audio.m4a")
 
-        try:
-            with open(audio_path, "rb") as f:
-                resp = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                )
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"OpenAI Whisper failed: {str(e)}")
+        format_selector = "bestaudio[ext=m4a]/bestaudio/best[ext=mp4]/best"
 
-        text = (getattr(resp, "text", None) or "").strip()
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--no-warnings",
+            "--extract-audio",
+            "--audio-format", "m4a",
+            "--audio-quality", "0",
+            "-f", format_selector,
+            "-o", out_path,
+            video_url,
+        ]
+
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        if p.returncode != 0:
+            raise HTTPException(
+                status_code=502,
+                detail=f"yt-dlp failed:\n{(p.stderr or '')[-1500:]}"
+            )
+
+        if not os.path.exists(final_audio):
+            candidates = [f for f in os.listdir(td) if f.startswith("audio.")]
+            raise HTTPException(
+                status_code=502,
+                detail=f"audio file not created. Found: {candidates}"
+            )
+
+        with open(final_audio, "rb") as f:
+            resp = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f
+            )
+
+        text = (getattr(resp, "text", "") or "").strip()
         if len(text) < 10:
             raise HTTPException(status_code=502, detail="empty transcript")
 
         return {"transcript": text}
+
+
